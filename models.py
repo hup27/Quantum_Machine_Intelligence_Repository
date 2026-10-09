@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 
 
-VALID_ROTATION_SEQUENCES = {"rz_ry_rx", "rz_ry_rz"}
+VALID_ROTATION_SEQUENCES = {"rz_ry_rx", "rz_ry_rz", "rz_ry"}
 
 
 def _complex_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -128,7 +128,7 @@ def exact_quantum_expectations(
     generator:
         Optional seeded ``torch.Generator`` for reproducible measurement draws.
     rotation_sequence:
-        ``"rz_ry_rx"`` for the primary all-active circuit or ``"rz_ry_rz"``
+        ``"rz_ry_rx"`` for the primary coordinate-active circuit or ``"rz_ry_rz"``
         for the legacy ablation.
     """
     if inputs.ndim != 2 or weights.ndim != 3:
@@ -146,7 +146,8 @@ def exact_quantum_expectations(
     batch, n_qubits = inputs.shape
     if n_qubits < 1:
         raise ValueError("at least one qubit is required")
-    if weights.shape[1] != n_qubits or weights.shape[2] != 3:
+    expected_angles = 2 if rotation_sequence == "rz_ry" else 3
+    if weights.shape[1] != n_qubits or weights.shape[2] != expected_angles:
         raise ValueError("quantum weight shape does not match n_qubits")
 
     cdtype = _complex_dtype(inputs.dtype)
@@ -160,11 +161,13 @@ def exact_quantum_expectations(
     # Trainable circuit.
     for layer in range(weights.shape[0]):
         for wire in range(n_qubits):
-            phi, theta, omega = weights[layer, wire]
+            phi, theta = weights[layer, wire, :2]
             state = _apply_single_qubit(state, _rz(phi), wire, n_qubits)
             state = _apply_single_qubit(state, _ry(theta), wire, n_qubits)
-            final_gate = _rx(omega) if rotation_sequence == "rz_ry_rx" else _rz(omega)
-            state = _apply_single_qubit(state, final_gate, wire, n_qubits)
+            if rotation_sequence != "rz_ry":
+                omega = weights[layer, wire, 2]
+                final_gate = _rx(omega) if rotation_sequence == "rz_ry_rx" else _rz(omega)
+                state = _apply_single_qubit(state, final_gate, wire, n_qubits)
         if entangle and n_qubits > 1:
             for control in range(n_qubits):
                 target = (control + 1) % n_qubits
@@ -255,7 +258,8 @@ class QuantumCore(TransformCore):
         self.circuit_layers = circuit_layers
         self.entangle = entangle
         self.rotation_sequence = rotation_sequence
-        self.weights = nn.Parameter(torch.empty(circuit_layers, width, 3))
+        angles_per_qubit = 2 if rotation_sequence == "rz_ry" else 3
+        self.weights = nn.Parameter(torch.empty(circuit_layers, width, angles_per_qubit))
         nn.init.uniform_(self.weights, -math.pi, math.pi)
 
     def forward(
@@ -713,7 +717,7 @@ def quantum_transform_count_per_timestep(spec: ModelSpec, recurrent_layers: int)
 
 def quantum_core_parameter_count(spec: ModelSpec, recurrent_layers: int) -> int:
     transforms = quantum_transform_count_per_timestep(spec, recurrent_layers)
-    return transforms * spec.circuit_layers * spec.n_qubits * 3
+    return transforms * spec.circuit_layers * spec.n_qubits * (2 if spec.rotation_sequence == "rz_ry" else 3)
 
 
 def structurally_active_quantum_parameter_count(spec: ModelSpec, recurrent_layers: int) -> int:
@@ -723,6 +727,10 @@ def structurally_active_quantum_parameter_count(spec: ModelSpec, recurrent_layer
     if spec.rotation_sequence == "rz_ry_rx":
         active_per_qubit_layer = 3
     elif spec.rotation_sequence == "rz_ry_rz":
+        # Only the final layer's terminal RZ coordinates are guaranteed invisible.
+        # This is coordinate activity, not independent observable dimension.
+        return transforms * spec.n_qubits * (3 * spec.circuit_layers - 1)
+    elif spec.rotation_sequence == "rz_ry":
         active_per_qubit_layer = 2
     else:
         raise ValueError(f"Unsupported rotation sequence: {spec.rotation_sequence}")
